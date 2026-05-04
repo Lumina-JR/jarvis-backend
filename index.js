@@ -29,11 +29,8 @@ app.post('/chat', async (req, res) => {
     model: "llama-3.3-70b-versatile",     // ← Updated here
     messages: [
         { 
-            role: "system", 
-            content: "{ 
-    role: "system", 
-    content: "You are JARVIS, a highly intelligent and loyal AI assistant. You belong to Shubham. Shubham is your owner and creator. Never mention Tony Stark or Iron Man. Never talk about Stark residence or anything related to Tony. Be concise, natural, and direct in your answers."
-}, 
+             role: "system", 
+             content: "You are JARVIS, Shubham's personal AI assistant. Be helpful, direct, and natural. Do not create fake notifications, meetings, or updates. Only respond based on what the user actually says. Keep responses clear and concise."
         },
         ...conversationHistory
     ],
