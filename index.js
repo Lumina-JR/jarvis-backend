@@ -9,34 +9,43 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-let conversationHistory = [];
+// Install this package: npm install duck-duck-scrape
+const { DuckDuckGoSearch } = require('duck-duck-scrape');
 
-console.log("GROQ_API_KEY loaded:", process.env.GROQ_API_KEY ? "YES (length: " + process.env.GROQ_API_KEY.length + ")" : "NO");
+let conversationHistory = [];
 
 app.post('/chat', async (req, res) => {
     try {
         const { message } = req.body;
-
         if (!message) return res.status(400).json({ error: "Message is required" });
 
         conversationHistory.push({ role: "user", content: message });
 
-        if (!process.env.GROQ_API_KEY) {
-            return res.status(500).json({ error: "GROQ_API_KEY is not configured" });
+        let searchResults = "";
+
+        // If the question seems to need current information, search
+        if (/news|today|current|latest|weather|stock|price|what.*happened|who.*won/i.test(message)) {
+            try {
+                const search = await DuckDuckGoSearch.search(message, { safeSearch: DuckDuckGoSearch.SafeSearchType.OFF });
+                searchResults = "\n\nRecent information: " + search.results.slice(0, 2).map(r => r.title + ": " + r.description).join("\n");
+            } catch (e) {
+                console.log("Search failed");
+            }
         }
 
         const response = await axios.post('https://api.groq.com/openai/v1/chat/completions', {
-    model: "llama-3.3-70b-versatile",     // ← Updated here
-    messages: [
-        { 
-             role: "system", 
-             content: "You are JARVIS, Shubham's personal AI assistant. Be helpful, direct, and natural. Do not create fake notifications, meetings, or updates. Only respond based on what the user actually says. Keep responses clear and concise."
-        },
-        ...conversationHistory
-    ],
-    temperature: 0.7,
-    max_tokens: 500
-}, {
+            model: "llama-3.3-70b-versatile",
+            messages: [
+                { 
+                    role: "system", 
+                    content: "You are JARVIS, Shubham's personal AI assistant. You are warm, helpful, and slightly sarcastic in a friendly way. Speak naturally like a clever friend. Be concise but engaging. You belong to Shubham." 
+                },
+                ...conversationHistory,
+                { role: "user", content: message + searchResults }
+            ],
+            temperature: 0.75,
+            max_tokens: 600
+        }, {
             headers: {
                 'Authorization': `Bearer ${process.env.GROQ_API_KEY}`,
                 'Content-Type': 'application/json'
@@ -44,6 +53,7 @@ app.post('/chat', async (req, res) => {
         });
 
         const reply = response.data.choices[0].message.content;
+
         conversationHistory.push({ role: "assistant", content: reply });
 
         if (conversationHistory.length > 20) conversationHistory = conversationHistory.slice(-20);
@@ -51,11 +61,8 @@ app.post('/chat', async (req, res) => {
         res.json({ reply });
 
     } catch (error) {
-        console.error("Error:", error.response?.data || error.message);
-        res.status(500).json({ 
-            error: "Something went wrong",
-            details: error.response?.data || error.message 
-        });
+        console.error(error.message);
+        res.status(500).json({ error: "Something went wrong" });
     }
 });
 
