@@ -26,17 +26,17 @@ app.post('/chat', async (req, res) => {
         }
 
         const response = await axios.post('https://api.groq.com/openai/v1/chat/completions', {
-            model: "llama-3.1-70b-versatile",
-            messages: [
-                { 
-                    role: "system", 
-                    content: "You are JARVIS, a highly intelligent, witty, and loyal AI assistant inspired by Iron Man." 
-                },
-                ...conversationHistory
-            ],
-            temperature: 0.7,
-            max_tokens: 500
-        }, {
+    model: "llama-3.3-70b-versatile",     // ← Updated here
+    messages: [
+        { 
+            role: "system", 
+            content: "You are JARVIS, a highly intelligent, witty, and loyal AI assistant inspired by Iron Man." 
+        },
+        ...conversationHistory
+    ],
+    temperature: 0.7,
+    max_tokens: 500
+}, {
             headers: {
                 'Authorization': `Bearer ${process.env.GROQ_API_KEY}`,
                 'Content-Type': 'application/json'
