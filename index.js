@@ -83,6 +83,30 @@ app.get('/', (req, res) => {
     res.send('Jarvis Backend is Running with Deepgram 🚀');
 });
 
+// Deepgram Transcribe Endpoint
+app.post('/transcribe', async (req, res) => {
+    try {
+        const formData = new FormData();
+        formData.append('file', req.files ? req.files.audio.data : req.body.audio, 'audio.webm');
+
+        const response = await axios.post('https://api.deepgram.com/v1/listen?model=nova-2-general&smart_format=true', 
+            formData, {
+            headers: {
+                'Authorization': `Token ${process.env.DEEPGRAM_API_KEY}`,
+                ...formData.getHeaders()
+            }
+        });
+
+        const transcript = response.data.results.channels[0 0].transcript;
+        
+        res.json({ text: transcript || "" });
+
+    } catch (error) {
+        console.error("Transcription Error:", error.message);
+        res.status(500).json({ error: "Transcription failed" });
+    }
+});
+
 app.listen(PORT, () => {
     console.log(`Jarvis Backend running on port ${PORT}`);
 });
