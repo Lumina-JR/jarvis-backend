@@ -1,15 +1,15 @@
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
-const fileUpload = require('express-fileupload');
+const multer = require('multer');
 require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const upload = multer();
 
 app.use(cors());
 app.use(express.json());
-app.use(fileUpload({ createParentPath: true }));
 
 let conversationHistory = [];
 
@@ -51,24 +51,19 @@ app.post('/chat', async (req, res) => {
 });
 
 // Deepgram Transcription
-app.post('/transcribe', async (req, res) => {
+app.post('/transcribe', upload.single('audio'), async (req, res) => {
     try {
-        if (!req.files || !req.files.audio) {
-            return res.status(400).json({ error: "No audio file uploaded" });
+        if (!req.file) {
+            return res.status(400).json({ error: "No audio received" });
         }
-
-        const audioFile = req.files.audio;
-
-        const formData = new (require('form-data'))();
-        formData.append('file', audioFile.data, 'audio.webm');
 
         const response = await axios.post(
             'https://api.deepgram.com/v1/listen?model=nova-2-general&smart_format=true',
-            formData,
+            req.file.buffer,
             {
                 headers: {
                     'Authorization': `Token ${process.env.DEEPGRAM_API_KEY}`,
-                    ...formData.getHeaders()
+                    'Content-Type': 'audio/webm'
                 }
             }
         );
@@ -109,7 +104,7 @@ app.post('/speak', async (req, res) => {
     }
 });
 
-app.get('/', (req, res) => res.send('Jarvis Backend Running with Deepgram'));
+app.get('/', (req, res) => res.send('Jarvis Backend Running'));
 
 app.listen(PORT, () => {
     console.log(`Jarvis Backend running on port ${PORT}`);
