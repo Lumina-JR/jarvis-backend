@@ -59,7 +59,7 @@ app.post('/speak', async (req, res) => {
         if (!text) return res.status(400).json({ error: "Text is required" });
 
         const response = await axios.post(
-            'https://api.deepgram.com/v1/speak?model=aura-2-draco-en',
+            'https://api.deepgram.com/v1/speak?model=aura-2-odysseus-en',
             { text: text },
             {
                 headers: {
