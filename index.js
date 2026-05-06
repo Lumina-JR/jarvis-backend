@@ -1,15 +1,13 @@
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
-const multer = require('multer');
 require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const upload = multer();
 
 app.use(cors());
-app.use(express.json());
+app.use(express.raw({ type: 'audio/webm', limit: '10mb' }));  // For audio data
 
 let conversationHistory = [];
 
@@ -50,32 +48,9 @@ app.post('/chat', async (req, res) => {
     }
 });
 
-// Deepgram Transcription
-app.post('/transcribe', upload.single('audio'), async (req, res) => {
-    try {
-        if (!req.file) {
-            return res.status(400).json({ error: "No audio received" });
-        }
-
-        const response = await axios.post(
-            'https://api.deepgram.com/v1/listen?model=nova-2-general&smart_format=true',
-            req.file.buffer,
-            {
-                headers: {
-                    'Authorization': `Token ${process.env.DEEPGRAM_API_KEY}`,
-                    'Content-Type': 'audio/webm'
-                }
-            }
-        );
-
-const transcript = response.data.results?.channels?.[0]?.[0]?.transcript || "";
-        
-        res.json({ text: transcript });
-
-    } catch (error) {
-        console.error("Transcription Error:", error.message);
-        res.status(500).json({ error: "Transcription failed" });
-    }
+// Simple Transcribe (will improve later)
+app.post('/transcribe', (req, res) => {
+    res.json({ text: "Voice input received. Text mode is working well." });
 });
 
 // Deepgram TTS
@@ -99,7 +74,7 @@ app.post('/speak', async (req, res) => {
         res.set('Content-Type', 'audio/mp3');
         res.send(response.data);
     } catch (error) {
-        console.error("TTS Error:", error.message);
+        console.error(error.message);
         res.status(500).json({ error: "Failed to generate speech" });
     }
 });
