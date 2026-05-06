@@ -68,8 +68,8 @@ app.post('/transcribe', upload.single('audio'), async (req, res) => {
             }
         );
 
-        const transcript = response.data.results?.channels?.[0 0]?.transcript || "";
-
+const transcript = response.data.results?.channels?.[0]?.[0]?.transcript || "";
+        
         res.json({ text: transcript });
 
     } catch (error) {
