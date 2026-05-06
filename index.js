@@ -52,8 +52,35 @@ app.post('/chat', async (req, res) => {
     }
 });
 
+// New endpoint for Deepgram TTS
+app.post('/speak', async (req, res) => {
+    try {
+        const { text } = req.body;
+        if (!text) return res.status(400).json({ error: "Text is required" });
+
+        const response = await axios.post(
+            'https://api.deepgram.com/v1/speak?model=aura-2-draco-en',
+            { text: text },
+            {
+                headers: {
+                    'Authorization': `Token ${process.env.DEEPGRAM_API_KEY}`,
+                    'Content-Type': 'application/json'
+                },
+                responseType: 'arraybuffer'
+            }
+        );
+
+        res.set('Content-Type', 'audio/mp3');
+        res.send(response.data);
+
+    } catch (error) {
+        console.error("TTS Error:", error.message);
+        res.status(500).json({ error: "Failed to generate speech" });
+    }
+});
+
 app.get('/', (req, res) => {
-    res.send('Jarvis Backend is Running 🚀');
+    res.send('Jarvis Backend is Running with Deepgram 🚀');
 });
 
 app.listen(PORT, () => {
