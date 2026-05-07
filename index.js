@@ -7,7 +7,7 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(cors());
-app.use(express.raw({ type: 'audio/webm', limit: '10mb' }));  // For audio data
+app.use(express.json());
 
 let conversationHistory = [];
 
@@ -37,23 +37,21 @@ app.post('/chat', async (req, res) => {
         });
 
         const reply = response.data.choices[0].message.content;
+
         conversationHistory.push({ role: "assistant", content: reply });
 
-        if (conversationHistory.length > 20) conversationHistory = conversationHistory.slice(-20);
+        if (conversationHistory.length > 20) {
+            conversationHistory = conversationHistory.slice(-20);
+        }
 
         res.json({ reply });
+
     } catch (error) {
         console.error(error.message);
         res.status(500).json({ error: "Something went wrong" });
     }
 });
 
-// Simple Transcribe (will improve later)
-app.post('/transcribe', (req, res) => {
-    res.json({ text: "Voice input received. Text mode is working well." });
-});
-
-// Deepgram TTS
 app.post('/speak', async (req, res) => {
     try {
         const { text } = req.body;
@@ -74,12 +72,14 @@ app.post('/speak', async (req, res) => {
         res.set('Content-Type', 'audio/mp3');
         res.send(response.data);
     } catch (error) {
-        console.error(error.message);
+        console.error("TTS Error:", error.message);
         res.status(500).json({ error: "Failed to generate speech" });
     }
 });
 
-app.get('/', (req, res) => res.send('Jarvis Backend Running'));
+app.get('/', (req, res) => {
+    res.send('Jarvis Backend is Running 🚀');
+});
 
 app.listen(PORT, () => {
     console.log(`Jarvis Backend running on port ${PORT}`);
