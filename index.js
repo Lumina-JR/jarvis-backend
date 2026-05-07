@@ -16,39 +16,51 @@ app.post('/chat', async (req, res) => {
         const { message } = req.body;
         if (!message) return res.status(400).json({ error: "Message is required" });
 
-        conversationHistory.push({ role: "user", content: message });
-
-        const response = await axios.post('https://api.groq.com/openai/v1/chat/completions', {
-            model: "llama-3.3-70b-versatile",
-            messages: [
-                { 
-                    role: "system", 
-                    content: "You are JARVIS, Shubham's personal AI assistant. You are warm, helpful, and slightly sarcastic in a friendly way. Speak naturally like a clever friend. Be concise but engaging." 
-                },
-                ...conversationHistory
-            ],
-            temperature: 0.75,
-            max_tokens: 600
-        }, {
-            headers: {
-                'Authorization': `Bearer ${process.env.GROQ_API_KEY}`,
-                'Content-Type': 'application/json'
-            }
-        });
-
-        const reply = response.data.choices[0].message.content;
-
-        conversationHistory.push({ role: "assistant", content: reply });
-
-        if (conversationHistory.length > 20) {
-            conversationHistory = conversationHistory.slice(-20);
+        // Trim history BEFORE pushing to keep it within bounds
+        if (conversationHistory.length >= 20) {
+            conversationHistory = conversationHistory.slice(-18); // Leave room for new pair
         }
 
+        conversationHistory.push({ role: "user", content: message });
+
+        let reply;
+        try {
+            const response = await axios.post(
+                'https://api.groq.com/openai/v1/chat/completions',
+                {
+                    model: "llama-3.3-70b-versatile",
+                    messages: [
+                        {
+                            role: "system",
+                            content: "You are JARVIS, Shubham's personal AI assistant. You are warm, helpful, and slightly sarcastic in a friendly way. Speak naturally like a clever friend. Be concise but engaging."
+                        },
+                        ...conversationHistory
+                    ],
+                    temperature: 0.75,
+                    max_tokens: 600
+                },
+                {
+                    headers: {
+                        'Authorization': `Bearer ${process.env.GROQ_API_KEY}`,
+                        'Content-Type': 'application/json'
+                    }
+                }
+            );
+
+            reply = response.data.choices[0].message.content;
+        } catch (apiError) {
+            // Roll back the user message so history stays clean
+            conversationHistory.pop();
+            console.error("Groq API Error:", JSON.stringify(apiError.response?.data, null, 2) ?? apiError.message);
+            return res.status(500).json({ error: "Something went wrong while contacting the AI." });
+        }
+
+        conversationHistory.push({ role: "assistant", content: reply });
         res.json({ reply });
 
     } catch (error) {
-        console.error(error.message);
-        res.status(500).json({ error: "Something went wrong" });
+        console.error("Unexpected Error:", error.message);
+        res.status(500).json({ error: "Something went wrong." });
     }
 });
 
@@ -71,9 +83,10 @@ app.post('/speak', async (req, res) => {
 
         res.set('Content-Type', 'audio/mp3');
         res.send(response.data);
+
     } catch (error) {
-        console.error("TTS Error:", error.message);
-        res.status(500).json({ error: "Failed to generate speech" });
+        console.error("TTS Error:", JSON.stringify(error.response?.data, null, 2) ?? error.message);
+        res.status(500).json({ error: "Failed to generate speech." });
     }
 });
 
