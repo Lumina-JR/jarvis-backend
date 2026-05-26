@@ -1,7 +1,6 @@
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
-const { tavily } = require('@tavily/core');
 require('dotenv').config();
 
 const app  = express();
@@ -9,9 +8,6 @@ const PORT = process.env.PORT || 3000;
 
 app.use(cors());
 app.use(express.json());
-
-// Tavily client
-const tavilyClient = tavily({ apiKey: process.env.TAVILY_API_KEY });
 
 let conversationHistory = [];
 
@@ -64,23 +60,28 @@ function needsSearch(message) {
 ═══════════════════════════════════════════════════════════════ */
 async function searchWeb(query) {
     try {
-        const response = await tavilyClient.search(query, {
-            searchDepth: "basic",
-            maxResults: 3,
-            includeAnswer: true    // Tavily's own AI summary — very useful
-        });
+        const response = await axios.post(
+            'https://api.tavily.com/search',
+            {
+                api_key: process.env.TAVILY_API_KEY,
+                query: query,
+                search_depth: "basic",
+                max_results: 3,
+                include_answer: true
+            },
+            { headers: { 'Content-Type': 'application/json' } }
+        );
 
+        const data = response.data;
         let context = '';
 
-        // Use Tavily's own answer summary if available
-        if (response.answer) {
-            context += `Summary: ${response.answer}\n\n`;
+        if (data.answer) {
+            context += `Summary: ${data.answer}\n\n`;
         }
 
-        // Add top result snippets for extra detail
-        if (response.results?.length > 0) {
+        if (data.results?.length > 0) {
             context += 'Supporting details:\n';
-            response.results.slice(0, 3).forEach((r, i) => {
+            data.results.slice(0, 3).forEach((r, i) => {
                 context += `${i + 1}. ${r.title}: ${r.content?.slice(0, 200)}...\n`;
             });
         }
