@@ -578,10 +578,9 @@ async function extractAndSaveMemories(userMessage, conversationContext = []) {
         }));
 
         const extractionPrompt = `
-You are the memory extraction component of J.A.R.V.I.S.
+You are the memory decision component of J.A.R.V.I.S.
 
-Review the recent conversation and identify at most 3 useful, durable memories.
-The conversation is provided as JSON turns with roles "user" and "assistant".
+Review the recent conversation and the existing memory catalogue. Return at most 3 candidate memories.
 
 SOURCE-OF-TRUTH RULES:
 - Extract facts only when explicitly stated or clearly corrected by the USER.
@@ -593,11 +592,19 @@ SOURCE-OF-TRUTH RULES:
 - Do not store medical or other highly sensitive personal information, credentials,
   secrets, passwords, API keys, tokens, or financial account identifiers.
 - If the latest user message asks not to remember/store information, return no memories.
-- A clear user correction should update the existing matching memory.
-- When an existing memory describes the same fact, REUSE ITS KEY exactly.
-- Do not create a new key merely because the wording changed.
-- Use short, stable snake_case keys. Prefer one fact per memory.
-- Confidence must be a number from 0.75 to 1.0. If uncertain, omit the fact.
+- A correction or changed decision should UPDATE the matching existing memory.
+- If an existing memory already expresses the same fact, do not create another record.
+- Reuse an existing key exactly whenever updating an existing fact.
+- Use NEW only for a genuinely distinct fact not already represented in the catalogue.
+- Use IGNORE when there is no durable memory or no meaningful change.
+- Do not split one decision into multiple records unless the facts are independently useful.
+- Confidence must be a number from 0.75 to 1.0. If uncertain, omit the candidate.
+
+For each candidate, choose:
+- action: "NEW" for a genuinely new fact
+- action: "UPDATE" for a correction/refinement of an existing fact
+- action: "IGNORE" if no write is needed
+- target_key: exact existing key for UPDATE; empty string for NEW/IGNORE
 
 Allowed categories: preference, project, professional, goal, general.
 
@@ -605,6 +612,8 @@ Return ONLY valid JSON in this structure:
 {
   "memories": [
     {
+      "action": "NEW|UPDATE|IGNORE",
+      "target_key": "exact_existing_key_or_empty",
       "key": "short_stable_snake_case_identifier",
       "value": "concise factual memory",
       "category": "preference|project|professional|goal|general",
@@ -645,6 +654,25 @@ Return {"memories": []} if nothing qualifies. Do not use Markdown fences.
         if (!Array.isArray(parsed.memories)) return;
 
         const seenKeys = new Set();
+        const existingByKey = new Map(
+            existingMemories.map(memory => [memory.memory_key, memory])
+        );
+
+        function textTokens(text) {
+            return new Set(
+                String(text || '').toLowerCase()
+                    .match(/[a-z0-9]{3,}/g) || []
+            );
+        }
+
+        function jaccardSimilarity(left, right) {
+            const a = textTokens(left);
+            const b = textTokens(right);
+            if (!a.size || !b.size) return 0;
+            let intersection = 0;
+            for (const token of a) if (b.has(token)) intersection++;
+            return intersection / (a.size + b.size - intersection);
+        }
 
         for (const item of parsed.memories.slice(0, 3)) {
             if (
@@ -655,7 +683,13 @@ Return {"memories": []} if nothing qualifies. Do not use Markdown fences.
                 continue;
             }
 
-            const key = normaliseMemoryKey(item.key);
+            const action = ['NEW', 'UPDATE', 'IGNORE'].includes(
+                String(item.action || '').toUpperCase()
+            ) ? String(item.action).toUpperCase() : 'NEW';
+            const proposedKey = normaliseMemoryKey(item.key);
+            const targetKey = typeof item.target_key === 'string'
+                ? item.target_key.trim()
+                : '';
             const value = item.value.trim();
             const category = [
                 'preference', 'project', 'professional', 'goal', 'general'
@@ -664,10 +698,14 @@ Return {"memories": []} if nothing qualifies. Do not use Markdown fences.
                 : 'general';
             const confidence = Number(item.confidence);
 
+            if (action === 'IGNORE') {
+                console.log('[Memory] Candidate ignored by classifier.');
+                continue;
+            }
+
             if (
-                !key ||
+                !proposedKey ||
                 !value ||
-                seenKeys.has(key) ||
                 value.length > MAX_MEMORY_VALUE_LENGTH ||
                 containsSensitiveInformation(value) ||
                 !Number.isFinite(confidence) ||
@@ -677,6 +715,38 @@ Return {"memories": []} if nothing qualifies. Do not use Markdown fences.
                 continue;
             }
 
+            let key = proposedKey;
+
+            if (action === 'UPDATE') {
+                // Never let the model invent an update target. It must name
+                // a key that actually exists in the catalogue we fetched.
+                if (!targetKey || !existingByKey.has(targetKey)) {
+                    console.warn('[Memory] Rejected UPDATE with unknown target key.');
+                    continue;
+                }
+                key = targetKey;
+            } else {
+                // A NEW action must not create a second record for an obvious
+                // near-identical fact. Exact key collisions are handled as updates.
+                if (existingByKey.has(key)) {
+                    console.log(`[Memory] Reusing existing key for candidate: ${key}`);
+                } else {
+                    const duplicate = existingMemories.find(memory => {
+                        const keySimilarity = jaccardSimilarity(key.replace(/_/g, ' '), memory.memory_key.replace(/_/g, ' '));
+                        const valueSimilarity = jaccardSimilarity(value, memory.memory_value);
+                        return keySimilarity >= 0.8 || valueSimilarity >= 0.82;
+                    });
+
+                    if (duplicate) {
+                        console.log(
+                            `[Memory] Skipped likely duplicate candidate; existing key: ${duplicate.memory_key}`
+                        );
+                        continue;
+                    }
+                }
+            }
+
+            if (seenKeys.has(key)) continue;
             seenKeys.add(key);
 
             const result = await queryDatabase(
@@ -695,7 +765,7 @@ Return {"memories": []} if nothing qualifies. Do not use Markdown fences.
             );
 
             if (result) {
-                console.log(`[Memory] Saved or updated: ${key}`);
+                console.log(`[Memory] ${action === 'UPDATE' ? 'Updated' : 'Saved'}: ${key}`);
             }
         }
     } catch (error) {
