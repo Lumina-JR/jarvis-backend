@@ -1,4 +1,3 @@
-
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
@@ -26,6 +25,10 @@ const MEMORY_TABLE = 'public.jarvis_memories';
 const MAX_RETRIEVED_MEMORIES = 8;
 const MAX_MEMORY_VALUE_LENGTH = 1500;
 
+// TTS protection. This is a conservative application-level limit,
+// not a statement of Deepgram's exact maximum request size.
+const MAX_TTS_CHARACTERS = 5000;
+
 app.use(cors());
 app.use(express.json({ limit: '1mb' }));
 
@@ -43,9 +46,6 @@ const http = axios.create({
 // ============================================================
 // POSTGRESQL CONNECTION
 // ============================================================
-
-// If the database is temporarily unavailable, J.A.R.V.I.S.
-// should still be able to answer using its existing LLM.
 
 let databaseAvailable = false;
 let databaseWarningLogged = false;
@@ -383,7 +383,10 @@ async function generateReply(messages, options = {}) {
             model: GROQ_MODEL,
             messages,
             temperature: options.temperature ?? 0.7,
-            max_tokens: options.max_tokens ?? 1000
+
+            // Reduced from 1000 to keep normal responses more concise.
+            // Individual calls can still supply their own token limit.
+            max_tokens: options.max_tokens ?? 600
         },
         {
             headers: {
@@ -534,19 +537,29 @@ function buildRecentConversationContext(history, currentMessage) {
         }));
 
     // Ensure the latest user message is present even if history is empty.
-    if (!recent.some(item => item.role === 'user' && item.content === currentMessage)) {
-        recent.push({ role: 'user', content: currentMessage.slice(0, 1800) });
+    if (!recent.some(item =>
+        item.role === 'user' && item.content === currentMessage
+    )) {
+        recent.push({
+            role: 'user',
+            content: currentMessage.slice(0, 1800)
+        });
     }
 
     return recent;
 }
 
-async function extractAndSaveMemories(userMessage, conversationContext = []) {
+async function extractAndSaveMemories(
+    userMessage,
+    conversationContext = []
+) {
     if (!pool || !process.env.GROQ_API_KEY) return;
 
     // Honour explicit opt-outs and avoid processing obvious secrets.
     if (isMemoryOptOut(userMessage)) {
-        console.log('[Memory] Skipped because the user requested no memory storage.');
+        console.log(
+            '[Memory] Skipped because the user requested no memory storage.'
+        );
         return;
     }
 
@@ -556,7 +569,9 @@ async function extractAndSaveMemories(userMessage, conversationContext = []) {
         .join('\n');
 
     if (containsSensitiveInformation(userOnlyText)) {
-        console.log('[Memory] Skipped a potentially sensitive conversation context.');
+        console.log(
+            '[Memory] Skipped a potentially sensitive conversation context.'
+        );
         return;
     }
 
@@ -571,6 +586,7 @@ async function extractAndSaveMemories(userMessage, conversationContext = []) {
         );
 
         const existingMemories = existingResult?.rows || [];
+
         const memoryCatalogue = existingMemories.map(memory => ({
             key: memory.memory_key,
             value: String(memory.memory_value || '').slice(0, 240),
@@ -578,9 +594,10 @@ async function extractAndSaveMemories(userMessage, conversationContext = []) {
         }));
 
         const extractionPrompt = `
-You are the memory decision component of J.A.R.V.I.S.
+You are the memory extraction component of J.A.R.V.I.S.
 
-Review the recent conversation and the existing memory catalogue. Return at most 3 candidate memories.
+Review the recent conversation and identify at most 3 useful, durable memories.
+The conversation is provided as JSON turns with roles "user" and "assistant".
 
 SOURCE-OF-TRUTH RULES:
 - Extract facts only when explicitly stated or clearly corrected by the USER.
@@ -592,19 +609,11 @@ SOURCE-OF-TRUTH RULES:
 - Do not store medical or other highly sensitive personal information, credentials,
   secrets, passwords, API keys, tokens, or financial account identifiers.
 - If the latest user message asks not to remember/store information, return no memories.
-- A correction or changed decision should UPDATE the matching existing memory.
-- If an existing memory already expresses the same fact, do not create another record.
-- Reuse an existing key exactly whenever updating an existing fact.
-- Use NEW only for a genuinely distinct fact not already represented in the catalogue.
-- Use IGNORE when there is no durable memory or no meaningful change.
-- Do not split one decision into multiple records unless the facts are independently useful.
-- Confidence must be a number from 0.75 to 1.0. If uncertain, omit the candidate.
-
-For each candidate, choose:
-- action: "NEW" for a genuinely new fact
-- action: "UPDATE" for a correction/refinement of an existing fact
-- action: "IGNORE" if no write is needed
-- target_key: exact existing key for UPDATE; empty string for NEW/IGNORE
+- A clear user correction should update the existing matching memory.
+- When an existing memory describes the same fact, REUSE ITS KEY exactly.
+- Do not create a new key merely because the wording changed.
+- Use short, stable snake_case keys. Prefer one fact per memory.
+- Confidence must be a number from 0.75 to 1.0. If uncertain, omit the fact.
 
 Allowed categories: preference, project, professional, goal, general.
 
@@ -612,8 +621,6 @@ Return ONLY valid JSON in this structure:
 {
   "memories": [
     {
-      "action": "NEW|UPDATE|IGNORE",
-      "target_key": "exact_existing_key_or_empty",
       "key": "short_stable_snake_case_identifier",
       "value": "concise factual memory",
       "category": "preference|project|professional|goal|general",
@@ -651,28 +658,10 @@ Return {"memories": []} if nothing qualifies. Do not use Markdown fences.
             .trim();
 
         const parsed = JSON.parse(cleaned);
+
         if (!Array.isArray(parsed.memories)) return;
 
         const seenKeys = new Set();
-        const existingByKey = new Map(
-            existingMemories.map(memory => [memory.memory_key, memory])
-        );
-
-        function textTokens(text) {
-            return new Set(
-                String(text || '').toLowerCase()
-                    .match(/[a-z0-9]{3,}/g) || []
-            );
-        }
-
-        function jaccardSimilarity(left, right) {
-            const a = textTokens(left);
-            const b = textTokens(right);
-            if (!a.size || !b.size) return 0;
-            let intersection = 0;
-            for (const token of a) if (b.has(token)) intersection++;
-            return intersection / (a.size + b.size - intersection);
-        }
 
         for (const item of parsed.memories.slice(0, 3)) {
             if (
@@ -683,29 +672,25 @@ Return {"memories": []} if nothing qualifies. Do not use Markdown fences.
                 continue;
             }
 
-            const action = ['NEW', 'UPDATE', 'IGNORE'].includes(
-                String(item.action || '').toUpperCase()
-            ) ? String(item.action).toUpperCase() : 'NEW';
-            const proposedKey = normaliseMemoryKey(item.key);
-            const targetKey = typeof item.target_key === 'string'
-                ? item.target_key.trim()
-                : '';
+            const key = normaliseMemoryKey(item.key);
             const value = item.value.trim();
+
             const category = [
-                'preference', 'project', 'professional', 'goal', 'general'
+                'preference',
+                'project',
+                'professional',
+                'goal',
+                'general'
             ].includes(item.category)
                 ? item.category
                 : 'general';
+
             const confidence = Number(item.confidence);
 
-            if (action === 'IGNORE') {
-                console.log('[Memory] Candidate ignored by classifier.');
-                continue;
-            }
-
             if (
-                !proposedKey ||
+                !key ||
                 !value ||
+                seenKeys.has(key) ||
                 value.length > MAX_MEMORY_VALUE_LENGTH ||
                 containsSensitiveInformation(value) ||
                 !Number.isFinite(confidence) ||
@@ -715,38 +700,6 @@ Return {"memories": []} if nothing qualifies. Do not use Markdown fences.
                 continue;
             }
 
-            let key = proposedKey;
-
-            if (action === 'UPDATE') {
-                // Never let the model invent an update target. It must name
-                // a key that actually exists in the catalogue we fetched.
-                if (!targetKey || !existingByKey.has(targetKey)) {
-                    console.warn('[Memory] Rejected UPDATE with unknown target key.');
-                    continue;
-                }
-                key = targetKey;
-            } else {
-                // A NEW action must not create a second record for an obvious
-                // near-identical fact. Exact key collisions are handled as updates.
-                if (existingByKey.has(key)) {
-                    console.log(`[Memory] Reusing existing key for candidate: ${key}`);
-                } else {
-                    const duplicate = existingMemories.find(memory => {
-                        const keySimilarity = jaccardSimilarity(key.replace(/_/g, ' '), memory.memory_key.replace(/_/g, ' '));
-                        const valueSimilarity = jaccardSimilarity(value, memory.memory_value);
-                        return keySimilarity >= 0.8 || valueSimilarity >= 0.82;
-                    });
-
-                    if (duplicate) {
-                        console.log(
-                            `[Memory] Skipped likely duplicate candidate; existing key: ${duplicate.memory_key}`
-                        );
-                        continue;
-                    }
-                }
-            }
-
-            if (seenKeys.has(key)) continue;
             seenKeys.add(key);
 
             const result = await queryDatabase(
@@ -765,7 +718,7 @@ Return {"memories": []} if nothing qualifies. Do not use Markdown fences.
             );
 
             if (result) {
-                console.log(`[Memory] ${action === 'UPDATE' ? 'Updated' : 'Saved'}: ${key}`);
+                console.log(`[Memory] Saved or updated: ${key}`);
             }
         }
     } catch (error) {
@@ -870,10 +823,14 @@ app.post('/chat', async (req, res) => {
 
         // Start extraction in the background. Do not make the user
         // wait for the second LLM call or database write.
-        const recentConversationContext = buildRecentConversationContext(history, cleanMessage);
+        const recentConversationContext =
+            buildRecentConversationContext(history, cleanMessage);
 
         setImmediate(() => {
-            extractAndSaveMemories(cleanMessage, recentConversationContext).catch(error => {
+            extractAndSaveMemories(
+                cleanMessage,
+                recentConversationContext
+            ).catch(error => {
                 console.error(
                     '[Memory] Background task failed:',
                     error.message
@@ -963,6 +920,37 @@ app.get('/memory/status', async (req, res) => {
 });
 
 // ============================================================
+// TEXT-TO-SPEECH — MARKDOWN CLEANUP
+// ============================================================
+
+// This function changes only the text sent to Deepgram.
+// The original formatted reply returned by /chat remains unchanged.
+function cleanTextForSpeech(text) {
+    return text
+        // Convert Markdown links to their readable labels.
+        .replace(/\[([^\]]+)\]\(https?:\/\/[^)]+\)/g, '$1')
+
+        // Remove Markdown headings.
+        .replace(/(^|\n)\s{0,3}#{1,6}\s+/g, '$1')
+
+        // Remove unordered and numbered list markers.
+        .replace(/(^|\n)\s*[-+*]\s+/g, '$1')
+        .replace(/(^|\n)\s*\d+[.)]\s+/g, '$1')
+
+        // Remove common emphasis and strikethrough markers.
+        .replace(/\*\*|__|~~/g, '')
+        .replace(/[*_`]/g, '')
+
+        // Remove Markdown blockquote markers.
+        .replace(/(^|\n)\s*>\s?/g, '$1')
+
+        // Normalise excessive spaces and blank lines.
+        .replace(/[ \t]{2,}/g, ' ')
+        .replace(/\n{3,}/g, '\n\n')
+        .trim();
+}
+
+// ============================================================
 // TEXT-TO-SPEECH — DEEPGRAM
 // ============================================================
 
@@ -981,10 +969,36 @@ app.post('/speak', async (req, res) => {
         });
     }
 
+    const speechText = cleanTextForSpeech(text);
+
+    if (!speechText) {
+        return res.status(400).json({
+            error: 'No speakable text remains after cleaning.'
+        });
+    }
+
+    // Prevent excessively long input from being sent to Deepgram.
+    // The client can request speech for shorter portions of a reply.
+    if (speechText.length > MAX_TTS_CHARACTERS) {
+        console.warn(
+            `[TTS] Rejected oversized text: ${speechText.length} characters.`
+        );
+
+        return res.status(413).json({
+            error: 'Text is too long for a single speech request.',
+            maxCharacters: MAX_TTS_CHARACTERS,
+            textLength: speechText.length
+        });
+    }
+
     try {
+        console.log(
+            `[TTS] Sending ${speechText.length} characters to Deepgram.`
+        );
+
         const response = await http.post(
             'https://api.deepgram.com/v1/speak?model=aura-2-odysseus-en',
-            { text: text.trim() },
+            { text: speechText },
             {
                 headers: {
                     Authorization: `Token ${process.env.DEEPGRAM_API_KEY}`
@@ -996,8 +1010,37 @@ app.post('/speak', async (req, res) => {
 
         res.set('Content-Type', 'audio/mpeg');
         return res.send(Buffer.from(response.data));
+
     } catch (error) {
-        console.error('[TTS Error]', error.message);
+        const status = error.response?.status;
+        let details = error.response?.data;
+
+        // Deepgram's error body may arrive as binary data because
+        // the successful response is configured as arraybuffer.
+        if (Buffer.isBuffer(details)) {
+            details = details.toString('utf8');
+        } else if (details instanceof ArrayBuffer) {
+            details = Buffer.from(details).toString('utf8');
+        }
+
+        if (typeof details === 'string') {
+            details = details.slice(0, 1500);
+        } else if (details != null) {
+            try {
+                details = JSON.stringify(details).slice(0, 1500);
+            } catch {
+                details = '[Response details unavailable]';
+            }
+        }
+
+        // Log diagnostic information without exposing the API key.
+        console.error('[TTS Error]', {
+            status: status || null,
+            code: error.code || null,
+            message: error.message,
+            textLength: speechText.length,
+            details: details || null
+        });
 
         return res.status(502).json({
             error: 'Failed to generate speech.'
@@ -1029,6 +1072,7 @@ app.listen(PORT, async () => {
 
     if (pool) {
         const connected = await checkDatabase();
+
         console.log(
             connected
                 ? '[Memory] PostgreSQL connected.'
@@ -1050,7 +1094,10 @@ async function shutdown(signal) {
         try {
             await pool.end();
         } catch (error) {
-            console.error('[Memory] Error closing pool:', error.message);
+            console.error(
+                '[Memory] Error closing pool:',
+                error.message
+            );
         }
     }
 
