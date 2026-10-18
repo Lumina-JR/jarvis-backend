@@ -515,40 +515,93 @@ function normaliseMemoryKey(key) {
 // MEMORY EXTRACTION AND STORAGE
 // ============================================================
 
-async function extractAndSaveMemories(userMessage) {
+function isMemoryOptOut(message) {
+    return /\b(don't|do not|never|please don't)\s+(remember|save|store|memorise|memorize)\b/i.test(message) ||
+        /\b(forget|delete|remove)\s+(this|that|it|my information|this information|that information)\b/i.test(message);
+}
+
+function buildRecentConversationContext(history, currentMessage) {
+    const recent = (Array.isArray(history) ? history : [])
+        .slice(-8)
+        .filter(item =>
+            item &&
+            (item.role === 'user' || item.role === 'assistant') &&
+            typeof item.content === 'string'
+        )
+        .map(item => ({
+            role: item.role,
+            content: item.content.slice(0, 1800)
+        }));
+
+    // Ensure the latest user message is present even if history is empty.
+    if (!recent.some(item => item.role === 'user' && item.content === currentMessage)) {
+        recent.push({ role: 'user', content: currentMessage.slice(0, 1800) });
+    }
+
+    return recent;
+}
+
+async function extractAndSaveMemories(userMessage, conversationContext = []) {
     if (!pool || !process.env.GROQ_API_KEY) return;
 
-    // Never send obvious credentials or highly sensitive material
-    // to the memory-extraction prompt.
-    if (containsSensitiveInformation(userMessage)) {
-        console.log('[Memory] Skipped a potentially sensitive message.');
+    // Honour explicit opt-outs and avoid processing obvious secrets.
+    if (isMemoryOptOut(userMessage)) {
+        console.log('[Memory] Skipped because the user requested no memory storage.');
         return;
     }
 
-    const extractionPrompt = `
+    const userOnlyText = conversationContext
+        .filter(turn => turn.role === 'user')
+        .map(turn => turn.content)
+        .join('\n');
+
+    if (containsSensitiveInformation(userOnlyText)) {
+        console.log('[Memory] Skipped a potentially sensitive conversation context.');
+        return;
+    }
+
+    try {
+        // Provide a compact catalogue so the model can reuse an existing
+        // key instead of creating a near-duplicate for a known fact.
+        const existingResult = await queryDatabase(
+            `SELECT memory_key, memory_value, category
+             FROM ${MEMORY_TABLE}
+             ORDER BY updated_at DESC
+             LIMIT 40`
+        );
+
+        const existingMemories = existingResult?.rows || [];
+        const memoryCatalogue = existingMemories.map(memory => ({
+            key: memory.memory_key,
+            value: String(memory.memory_value || '').slice(0, 240),
+            category: memory.category
+        }));
+
+        const extractionPrompt = `
 You are the memory extraction component of J.A.R.V.I.S.
 
-Analyse ONLY the user's message below. Extract at most 3 useful,
-reasonably stable facts that the user explicitly shared.
+Review the recent conversation and identify at most 3 useful, durable memories.
+The conversation is provided as JSON turns with roles "user" and "assistant".
 
-Good candidates:
-- Stable communication preferences
-- Ongoing projects and their explicit technical decisions
-- Explicitly stated professional goals
-- Durable preferences and corrections
-- Facts the user directly asks J.A.R.V.I.S. to remember
+SOURCE-OF-TRUTH RULES:
+- Extract facts only when explicitly stated or clearly corrected by the USER.
+- Assistant messages are context only. Never treat an assistant claim as proof of a user fact.
+- Do not infer facts from questions, hypotheticals, examples, jokes, or quoted material.
+- Prefer stable preferences, long-running projects, explicit decisions, professional goals,
+  and facts the user clearly intends J.A.R.V.I.S. to retain.
+- Ignore routine requests, one-off tasks, transient moods, and details unlikely to help later.
+- Do not store medical or other highly sensitive personal information, credentials,
+  secrets, passwords, API keys, tokens, or financial account identifiers.
+- If the latest user message asks not to remember/store information, return no memories.
+- A clear user correction should update the existing matching memory.
+- When an existing memory describes the same fact, REUSE ITS KEY exactly.
+- Do not create a new key merely because the wording changed.
+- Use short, stable snake_case keys. Prefer one fact per memory.
+- Confidence must be a number from 0.75 to 1.0. If uncertain, omit the fact.
 
-Do NOT save:
-- Passwords, credentials, API keys, access tokens or secrets
-- Medical or other highly sensitive personal information
-- Speculation, guesses, inferred identity attributes or assumptions
-- Temporary requests, jokes, hypothetical examples or quoted text
-- Information stated only by the assistant
-- Facts that are not actually supported by the user's message
+Allowed categories: preference, project, professional, goal, general.
 
-If the message contains no suitable memory, return {"memories": []}.
-
-Return ONLY valid JSON in this exact structure:
+Return ONLY valid JSON in this structure:
 {
   "memories": [
     {
@@ -560,27 +613,27 @@ Return ONLY valid JSON in this exact structure:
   ]
 }
 
-Keys should remain consistent for the same fact across messages.
-Use the user's explicit corrections to update existing facts.
-Do not include Markdown fences.
+RECENT CONVERSATION:
+${JSON.stringify(conversationContext).slice(0, 10000)}
 
-USER MESSAGE:
-${userMessage.slice(0, 4000)}
+EXISTING MEMORY CATALOGUE:
+${JSON.stringify(memoryCatalogue).slice(0, 7000)}
+
+Return {"memories": []} if nothing qualifies. Do not use Markdown fences.
 `;
 
-    try {
         const raw = await generateReply(
             [
                 {
                     role: 'system',
-                    content: 'Extract safe, explicit memories. Output valid JSON only.'
+                    content: 'Extract only safe, explicit user memories. Output valid JSON only.'
                 },
                 {
                     role: 'user',
                     content: extractionPrompt
                 }
             ],
-            { temperature: 0.1, max_tokens: 500 }
+            { temperature: 0.1, max_tokens: 600 }
         );
 
         const cleaned = raw
@@ -589,11 +642,11 @@ ${userMessage.slice(0, 4000)}
             .trim();
 
         const parsed = JSON.parse(cleaned);
-        const memories = parsed.memories;
+        if (!Array.isArray(parsed.memories)) return;
 
-        if (!Array.isArray(memories)) return;
+        const seenKeys = new Set();
 
-        for (const item of memories.slice(0, 3)) {
+        for (const item of parsed.memories.slice(0, 3)) {
             if (
                 !item ||
                 typeof item.key !== 'string' ||
@@ -605,17 +658,16 @@ ${userMessage.slice(0, 4000)}
             const key = normaliseMemoryKey(item.key);
             const value = item.value.trim();
             const category = [
-                'preference', 'project', 'professional',
-                'goal', 'general'
+                'preference', 'project', 'professional', 'goal', 'general'
             ].includes(item.category)
                 ? item.category
                 : 'general';
-
             const confidence = Number(item.confidence);
 
             if (
                 !key ||
                 !value ||
+                seenKeys.has(key) ||
                 value.length > MAX_MEMORY_VALUE_LENGTH ||
                 containsSensitiveInformation(value) ||
                 !Number.isFinite(confidence) ||
@@ -625,10 +677,11 @@ ${userMessage.slice(0, 4000)}
                 continue;
             }
 
+            seenKeys.add(key);
+
             const result = await queryDatabase(
                 `INSERT INTO ${MEMORY_TABLE}
-                    (memory_key, memory_value, category,
-                     confidence, source, updated_at)
+                    (memory_key, memory_value, category, confidence, source, updated_at)
                  VALUES ($1, $2, $3, $4, $5, NOW())
                  ON CONFLICT (memory_key)
                  DO UPDATE SET
@@ -646,7 +699,7 @@ ${userMessage.slice(0, 4000)}
             }
         }
     } catch (error) {
-        // A memory extraction failure must not break the main reply.
+        // Memory extraction must never interrupt the normal chat response.
         console.error('[Memory] Extraction failed:', error.message);
     }
 }
@@ -747,8 +800,10 @@ app.post('/chat', async (req, res) => {
 
         // Start extraction in the background. Do not make the user
         // wait for the second LLM call or database write.
+        const recentConversationContext = buildRecentConversationContext(history, cleanMessage);
+
         setImmediate(() => {
-            extractAndSaveMemories(cleanMessage).catch(error => {
+            extractAndSaveMemories(cleanMessage, recentConversationContext).catch(error => {
                 console.error(
                     '[Memory] Background task failed:',
                     error.message
