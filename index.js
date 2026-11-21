@@ -3,6 +3,7 @@
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
+const crypto = require('crypto');
 const { Pool } = require('pg');
 require('dotenv').config();
 
@@ -600,6 +601,159 @@ async function generateReply(messages, options = {}) {
     }
     return reply.trim();
 }
+
+// ============================================================
+// 8A. TEMPORARY SEEK CLASSIFIER TEST ENDPOINT
+// ============================================================
+
+app.post('/test/seek-classifier', rateLimit, async (req, res) => {
+    const expectedKey = process.env.JARVIS_SEEK_TEST_KEY;
+    const suppliedKey = req.get('x-seek-test-key');
+
+    if (!expectedKey) {
+        return res.status(503).json({
+            error: 'Seek classifier test endpoint is not configured.'
+        });
+    }
+
+    const expectedBuffer = Buffer.from(expectedKey);
+    const suppliedBuffer = Buffer.from(
+        typeof suppliedKey === 'string' ? suppliedKey : ''
+    );
+
+    if (
+        expectedBuffer.length !== suppliedBuffer.length ||
+        !crypto.timingSafeEqual(expectedBuffer, suppliedBuffer)
+    ) {
+        return res.status(401).json({
+            error: 'Unauthorised test request.'
+        });
+    }
+
+    const { message } = req.body || {};
+
+    if (
+        typeof message !== 'string' ||
+        !message.trim() ||
+        message.length > 2000
+    ) {
+        return res.status(400).json({
+            error: 'Provide a message between 1 and 2000 characters.'
+        });
+    }
+
+    if (!process.env.GROQ_API_KEY) {
+        return res.status(503).json({
+            error: 'Groq is not configured.'
+        });
+    }
+
+    const systemPrompt = `
+You are J.A.R.V.I.S.'s Seek Classifier.
+Classify the user's communicative intent. Do not answer the user or perform
+the request. Do not assume every message contains a request.
+
+SEEK CATEGORIES:
+- informational: seeks facts, explanations, definitions, or knowledge.
+- analytical: seeks evaluation, interpretation, comparison, or reasoning.
+- problem_solving: seeks help diagnosing or resolving a problem.
+- creative: seeks original ideas or creative content.
+- action_oriented: asks for an action, task, or concrete deliverable.
+- emotional_relational: seeks or expresses emotional support, empathy, or relationship engagement.
+- exploratory: thinks through possibilities, hypotheticals, or open-ended ideas.
+- conversational: invites ordinary dialogue without a specific task.
+- casual_sharing: shares an observation, update, or experience without necessarily asking for a response.
+
+A message may contain multiple seeks. Rank secondary seeks by relevance.
+Use primary_seek.category = null when no meaningful seek is present.
+Do not mistake a statement of difficulty, uncertainty, or emotion for an
+explicit request unless the user actually asks for help.
+"explicit_request" means the user clearly asks the assistant to do something;
+an implicit or inferred need does not count as explicit.
+"conversational_state" describes the message's presentation, not whether
+a seek exists. Choose the closest state.
+
+Return ONLY a JSON object in this exact shape:
+{
+  "primary_seek": {
+    "category": "informational",
+    "confidence": 0.0
+  },
+  "secondary_seeks": [],
+  "conversational_state": "ordinary_conversation",
+  "explicit_request": false,
+  "ambiguity": "low",
+  "summary": "Short explanation of the classification."
+}
+
+Allowed primary/secondary categories:
+informational, analytical, problem_solving, creative, action_oriented,
+emotional_relational, exploratory, conversational, casual_sharing.
+
+Allowed conversational_state values:
+ordinary_conversation, thinking_aloud, casual_sharing,
+explicit_request, emotional_expression, ambiguous.
+
+Allowed ambiguity values: low, medium, high.
+Confidence must be a number from 0 to 1.
+Use null category only for primary_seek when no meaningful seek exists.
+Use an empty array when there are no secondary seeks.
+Keep the summary concise.
+`;
+
+    try {
+        const response = await http.post(
+            GROQ_API_URL,
+            {
+                model: GROQ_MODEL,
+                messages: [
+                    { role: 'system', content: systemPrompt },
+                    { role: 'user', content: message.trim() }
+                ],
+                temperature: 0.1,
+                max_tokens: 700,
+                response_format: { type: 'json_object' }
+            },
+            {
+                timeout: LLM_TIMEOUT_MS,
+                headers: {
+                    Authorization: `Bearer ${process.env.GROQ_API_KEY}`
+                }
+            }
+        );
+
+        const content = response.data?.choices?.[0]?.message?.content;
+
+        if (typeof content !== 'string' || !content.trim()) {
+            throw new Error('The classifier returned an empty response.');
+        }
+
+        let classification;
+        try {
+            classification = JSON.parse(content);
+        } catch {
+            return res.status(502).json({
+                error: 'The classifier returned invalid JSON.'
+            });
+        }
+
+        res.set('Cache-Control', 'no-store');
+        return res.json({
+            model: GROQ_MODEL,
+            classification
+        });
+    } catch (error) {
+        console.error('[Seek Classifier Test Error]', {
+            status: error.response?.status || null,
+            code: error.code || null,
+            message: error.message
+        });
+
+        return res.status(502).json({
+            error: 'Seek classifier test failed.'
+        });
+    }
+});
 
 // ============================================================
 // 9. MEMORY RETRIEVAL — RELEVANCE FIRST, NO RANDOM FALLBACK
