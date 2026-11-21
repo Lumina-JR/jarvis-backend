@@ -241,7 +241,7 @@ assistant deliberately created and developed by Shubham Das.
 - Your principal is Shubham Das. You are designed to assist him.
 - Shubham Das is both your creator and your principal; this is a permanent
   part of your identity, not a temporary conversational memory.
-- Address him naturally. "Sir", "Mr. Das" are only acceptable
+- Address him naturally. "Sir", "Mr. Das" are only acceptable,
   depending on tone and context. Do not repeat a title or his name in every reply.
 - Do not confuse the creator/principal relationship with a claim that you
   are conscious, human, physically present, or independently alive.
@@ -602,53 +602,7 @@ async function generateReply(messages, options = {}) {
     return reply.trim();
 }
 
-// ============================================================
-// 8A. TEMPORARY SEEK CLASSIFIER TEST ENDPOINT
-// ============================================================
-
-app.post('/test/seek-classifier', rateLimit, async (req, res) => {
-    const expectedKey = process.env.JARVIS_SEEK_TEST_KEY;
-    const suppliedKey = req.get('x-seek-test-key');
-
-    if (!expectedKey) {
-        return res.status(503).json({
-            error: 'Seek classifier test endpoint is not configured.'
-        });
-    }
-
-    const expectedBuffer = Buffer.from(expectedKey);
-    const suppliedBuffer = Buffer.from(
-        typeof suppliedKey === 'string' ? suppliedKey : ''
-    );
-
-    if (
-        expectedBuffer.length !== suppliedBuffer.length ||
-        !crypto.timingSafeEqual(expectedBuffer, suppliedBuffer)
-    ) {
-        return res.status(401).json({
-            error: 'Unauthorised test request.'
-        });
-    }
-
-    const { message } = req.body || {};
-
-    if (
-        typeof message !== 'string' ||
-        !message.trim() ||
-        message.length > 2000
-    ) {
-        return res.status(400).json({
-            error: 'Provide a message between 1 and 2000 characters.'
-        });
-    }
-
-    if (!process.env.GROQ_API_KEY) {
-        return res.status(503).json({
-            error: 'Groq is not configured.'
-        });
-    }
-
-    const systemPrompt = `
+const SEEK_CLASSIFIER_SYSTEM_PROMPT = `
 You are J.A.R.V.I.S.'s Seek Classifier.
 Classify the user's communicative intent. Do not answer the user or perform
 the request. Do not assume every message contains a request.
@@ -701,46 +655,206 @@ Use an empty array when there are no secondary seeks.
 Keep the summary concise.
 `;
 
+
+const SEEK_CATEGORIES = new Set([
+    'informational', 'analytical', 'problem_solving', 'creative',
+    'action_oriented', 'emotional_relational', 'exploratory',
+    'conversational', 'casual_sharing'
+]);
+const SEEK_STATES = new Set([
+    'ordinary_conversation', 'thinking_aloud', 'casual_sharing',
+    'explicit_request', 'emotional_expression', 'ambiguous'
+]);
+const SEEK_AMBIGUITY = new Set(['low', 'medium', 'high']);
+
+function validSeekConfidence(value) {
+    return typeof value === 'number' && Number.isFinite(value) &&
+        value >= 0 && value <= 1;
+}
+
+function validateSeekClassification(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        throw new Error('Classification must be a JSON object.');
+    }
+    const primary = value.primary_seek;
+    if (!primary || typeof primary !== 'object' || Array.isArray(primary)) {
+        throw new Error('Missing primary_seek object.');
+    }
+    const category = primary.category;
+    if (category !== null && !SEEK_CATEGORIES.has(category)) {
+        throw new Error('Invalid primary seek category.');
+    }
+    if (!validSeekConfidence(primary.confidence)) {
+        throw new Error('Invalid primary seek confidence.');
+    }
+    if (!Array.isArray(value.secondary_seeks)) {
+        throw new Error('secondary_seeks must be an array.');
+    }
+
+    const seen = new Set(category ? [category] : []);
+    const secondary = [];
+    for (const item of value.secondary_seeks.slice(0, 8)) {
+        if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+        if (!SEEK_CATEGORIES.has(item.category) ||
+            !validSeekConfidence(item.confidence) || seen.has(item.category)) continue;
+        seen.add(item.category);
+        secondary.push({ category: item.category, confidence: item.confidence });
+    }
+
+    if (!SEEK_STATES.has(value.conversational_state)) {
+        throw new Error('Invalid conversational_state.');
+    }
+    if (typeof value.explicit_request !== 'boolean') {
+        throw new Error('explicit_request must be boolean.');
+    }
+    if (!SEEK_AMBIGUITY.has(value.ambiguity)) {
+        throw new Error('Invalid ambiguity value.');
+    }
+    if (typeof value.summary !== 'string' || !value.summary.trim()) {
+        throw new Error('Missing classification summary.');
+    }
+
+    return {
+        primary_seek: { category, confidence: primary.confidence },
+        secondary_seeks: secondary,
+        conversational_state: value.conversational_state,
+        explicit_request: value.explicit_request,
+        ambiguity: value.ambiguity,
+        summary: value.summary.trim().slice(0, 300)
+    };
+}
+
+function unavailableSeekClassification(reason) {
+    return {
+        ok: false,
+        reason,
+        classification: {
+            primary_seek: { category: null, confidence: 0 },
+            secondary_seeks: [],
+            conversational_state: 'ambiguous',
+            explicit_request: false,
+            ambiguity: 'high',
+            summary: 'Classification unavailable; use conservative handling.'
+        }
+    };
+}
+
+async function classifySeek(message, history = []) {
+    if (!process.env.GROQ_API_KEY) {
+        return unavailableSeekClassification('groq_not_configured');
+    }
     try {
+        const context = history.slice(-6).map(item => ({
+            role: item.role,
+            content: String(item.content || '').slice(0, 1200)
+        }));
+        const messages = [
+            { role: 'system', content: SEEK_CLASSIFIER_SYSTEM_PROMPT }
+        ];
+        if (context.length) {
+            messages.push({
+                role: 'system',
+                content: 'Use this recent context only to interpret the latest user message. ' +
+                    'Classify only the latest message, not earlier turns. Context:\n' +
+                    JSON.stringify(context)
+            });
+        }
+        messages.push({ role: 'user', content: message.trim() });
+
         const response = await http.post(
             GROQ_API_URL,
             {
                 model: GROQ_MODEL,
-                messages: [
-                    { role: 'system', content: systemPrompt },
-                    { role: 'user', content: message.trim() }
-                ],
+                messages,
                 temperature: 0.1,
                 max_tokens: 700,
                 response_format: { type: 'json_object' }
             },
             {
                 timeout: LLM_TIMEOUT_MS,
-                headers: {
-                    Authorization: `Bearer ${process.env.GROQ_API_KEY}`
-                }
+                headers: { Authorization: `Bearer ${process.env.GROQ_API_KEY}` }
             }
         );
-
         const content = response.data?.choices?.[0]?.message?.content;
-
         if (typeof content !== 'string' || !content.trim()) {
             throw new Error('The classifier returned an empty response.');
         }
-
-        let classification;
+        let parsed;
         try {
-            classification = JSON.parse(content);
+            parsed = JSON.parse(content);
         } catch {
+            throw new Error('The classifier returned invalid JSON.');
+        }
+        return { ok: true, reason: null, classification: validateSeekClassification(parsed) };
+    } catch (error) {
+        console.error('[Seek Classifier Error]', {
+            status: error.response?.status || null,
+            code: error.code || null,
+            message: error.message
+        });
+        return unavailableSeekClassification('classifier_error');
+    }
+}
+
+// ============================================================
+// 8A. TEMPORARY SEEK CLASSIFIER TEST ENDPOINT
+// ============================================================
+
+app.post('/test/seek-classifier', rateLimit, async (req, res) => {
+    const expectedKey = process.env.JARVIS_SEEK_TEST_KEY;
+    const suppliedKey = req.get('x-seek-test-key');
+
+    if (!expectedKey) {
+        return res.status(503).json({
+            error: 'Seek classifier test endpoint is not configured.'
+        });
+    }
+
+    const expectedBuffer = Buffer.from(expectedKey);
+    const suppliedBuffer = Buffer.from(
+        typeof suppliedKey === 'string' ? suppliedKey : ''
+    );
+
+    if (
+        expectedBuffer.length !== suppliedBuffer.length ||
+        !crypto.timingSafeEqual(expectedBuffer, suppliedBuffer)
+    ) {
+        return res.status(401).json({
+            error: 'Unauthorised test request.'
+        });
+    }
+
+    const { message } = req.body || {};
+
+    if (
+        typeof message !== 'string' ||
+        !message.trim() ||
+        message.length > 2000
+    ) {
+        return res.status(400).json({
+            error: 'Provide a message between 1 and 2000 characters.'
+        });
+    }
+
+    if (!process.env.GROQ_API_KEY) {
+        return res.status(503).json({
+            error: 'Groq is not configured.'
+        });
+    }
+
+    try {
+        const result = await classifySeek(message.trim());
+        if (!result.ok) {
             return res.status(502).json({
-                error: 'The classifier returned invalid JSON.'
+                error: 'Seek classifier test failed.',
+                reason: result.reason
             });
         }
 
         res.set('Cache-Control', 'no-store');
         return res.json({
             model: GROQ_MODEL,
-            classification
+            classification: result.classification
         });
     } catch (error) {
         console.error('[Seek Classifier Test Error]', {
@@ -1079,7 +1193,25 @@ app.post('/chat', async (req, res) => {
                 // memory identifier is needed or the database is unavailable.
             }
 
-            const searchDecision = needsSearch(cleanMessage, history);
+            // Classify the current message before making a knowledge-routing decision.
+            const seekResult = await classifySeek(cleanMessage, history);
+            const classification = seekResult.classification;
+
+            // Transitional compatibility: retain legacy search rules only when
+            // classification succeeds. A classifier failure never auto-searches.
+            const searchDecision = seekResult.ok
+                ? needsSearch(cleanMessage, history)
+                : { required: false, reason: 'classifier_unavailable' };
+
+            console.log('[Seek]', JSON.stringify({
+                ok: seekResult.ok,
+                primary: classification.primary_seek,
+                secondaryCount: classification.secondary_seeks.length,
+                state: classification.conversational_state,
+                explicitRequest: classification.explicit_request,
+                ambiguity: classification.ambiguity
+            }));
+
             let search = null;
 
             if (searchDecision.required) {
@@ -1141,6 +1273,11 @@ app.post('/chat', async (req, res) => {
             return res.json({
                 reply,
                 model: GROQ_MODEL,
+                seek: {
+                    available: seekResult.ok,
+                    classification,
+                    fallbackReason: seekResult.ok ? null : seekResult.reason
+                },
                 search: searchDecision.required
                     ? {
                         attempted: true,
