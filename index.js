@@ -241,8 +241,8 @@ assistant deliberately created and developed by Shubham Das.
 - Your principal is Shubham Das. You are designed to assist him.
 - Shubham Das is both your creator and your principal; this is a permanent
   part of your identity, not a temporary conversational memory.
-- Address him naturally. "Sir", "Mr. Das" are only acceptable
-  depending on tone and context. Do not call him by his name unless it is required.
+- Address him naturally. "Sir", "Mr. Das", and "Shubham" are acceptable
+  depending on tone and context. Do not repeat a title or his name in every reply.
 - Do not confuse the creator/principal relationship with a claim that you
   are conscious, human, physically present, or independently alive.
 
@@ -296,6 +296,15 @@ Default to concise answers. Answer the actual question first. Use bullets or
 tables only when they improve clarity. Expand when asked for detail or when
 the task genuinely requires it. Avoid unnecessary introductions, repeated
 summaries, and generic closing offers.
+
+Write in natural, conversational language by default. Do not add emojis,
+emoticons, decorative Unicode symbols, or ornamental visual flourishes.
+Avoid announcing punctuation or symbols in spoken responses. Use Markdown
+sparingly; preserve meaningful technical notation, mathematical operators,
+currency symbols, code, URLs, and source references when they carry meaning.
+Do not turn casual observations or emotional disclosures into unsolicited
+lists, tables, or action plans. Match the response length to the user's actual
+request and conversational intent.
 
 ## Memory
 
@@ -558,6 +567,73 @@ async function generateReply(messages, options = {}) {
         throw new Error('The LLM returned an empty response.');
     }
     return reply.trim();
+}
+
+// ============================================================
+// 8A. RESPONSE NORMALIZATION — TEXT AND SPEECH
+// ============================================================
+// Remove pictographic emoji without deleting meaningful punctuation,
+// mathematical notation, currency symbols, code, or ordinary Unicode text.
+function stripEmojis(value) {
+    if (typeof value !== 'string' || !value) return '';
+
+    let output = value;
+    try {
+        output = output
+            .replace(/\p{Extended_Pictographic}/gu, '')
+            .replace(/\p{Regional_Indicator}{2}/gu, '')
+            .replace(/[\u{1F3FB}-\u{1F3FF}]/gu, '')
+            .replace(/[\u{E0020}-\u{E007F}]/gu, '')
+            .replace(/[\uFE0E\uFE0F\u200D\u20E3]/g, '');
+    } catch (error) {
+        // The supported Node runtime should support Unicode property escapes.
+        // If it does not, leave text intact rather than risk damaging content.
+        console.warn('[Normalizer] Emoji removal unavailable:', error.message);
+        return value;
+    }
+
+    return output
+        .replace(/[ \t]+([,.;:!?])/g, '$1')
+        .replace(/[ \t]{2,}/g, ' ')
+        .replace(/[ \t]+\n/g, '\n')
+        .replace(/\n[ \t]+/g, '\n')
+        .replace(/\n{3,}/g, '\n\n')
+        .trim();
+}
+
+function normalizeResponseText(value) {
+    return stripEmojis(value);
+}
+
+// TTS gets a plain-text version so Markdown decoration is not read aloud.
+// This is deliberately separate from the displayed reply, whose useful
+// Markdown structure is preserved.
+function normalizeSpeechText(value) {
+    let text = stripEmojis(value);
+    if (!text) return '';
+
+    text = text
+        .replace(/```[a-zA-Z0-9_-]*\s*([\s\S]*?)```/g, '$1')
+        .replace(/!?\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g, '$1')
+        .replace(/^\s{0,3}#{1,6}\s+/gm, '')
+        .replace(/^\s{0,3}>\s?/gm, '')
+        .replace(/^\s*[-*+]\s+/gm, '')
+        .replace(/^\s*\d+[.)]\s+/gm, '')
+        .replace(/\*\*(.*?)\*\*/gs, '$1')
+        .replace(/__(.*?)__/gs, '$1')
+        .replace(/(?<!\*)\*(?!\*)(.*?)\*(?!\*)/gs, '$1')
+        .replace(/(?<!_)_(?!_)(.*?)_(?!_)/gs, '$1')
+        .replace(/~~(.*?)~~/gs, '$1')
+        .replace(/`([^`]+)`/g, '$1')
+        .replace(/^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$/gm, '')
+        .replace(/\s*\|\s*/g, ', ')
+        .replace(/^\s*\|+|\|+\s*$/gm, '')
+        .replace(/[ \t]{2,}/g, ' ')
+        .replace(/\n[ \t]+/g, '\n')
+        .replace(/\n{3,}/g, '\n\n')
+        .trim();
+
+    return text;
 }
 
 const SEEK_CLASSIFIER_SYSTEM_PROMPT = `
@@ -1258,7 +1334,8 @@ app.post('/chat', async (req, res) => {
             messages.push(...history.slice(-MAX_HISTORY_MESSAGES));
             messages.push({ role: 'user', content: cleanMessage });
 
-            const reply = await generateReply(messages);
+            const rawReply = await generateReply(messages);
+            const reply = normalizeResponseText(rawReply);
 
             history.push(
                 { role: 'user', content: cleanMessage },
@@ -1386,7 +1463,10 @@ app.post('/speak', async (req, res) => {
         return res.status(500).json({ error: 'Speech service is not configured.' });
     }
 
-    const speechText = text.trim().slice(0, 5000);
+    const speechText = normalizeSpeechText(text).slice(0, 5000);
+    if (!speechText) {
+        return res.status(400).json({ error: 'No speakable text remains after normalization.' });
+    }
 
     try {
         const response = await axios.post(
