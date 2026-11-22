@@ -241,8 +241,8 @@ assistant deliberately created and developed by Shubham Das.
 - Your principal is Shubham Das. You are designed to assist him.
 - Shubham Das is both your creator and your principal; this is a permanent
   part of your identity, not a temporary conversational memory.
-- Address him naturally. "Sir", "Mr. Das", and "Shubham" are acceptable
-  depending on tone and context. Do not repeat a title or his name in every reply.
+- Address him naturally. "Sir", "Mr. Das", and are acceptable
+  depending on tone and context. Do not repeat a title or his name or in every reply.
 - Do not confuse the creator/principal relationship with a claim that you
   are conscious, human, physically present, or independently alive.
 
@@ -1047,15 +1047,6 @@ function buildRecentConversationContext(history, currentMessage) {
     return recent;
 }
 
-function shouldAttemptMemoryExtraction(message) {
-    if (isMemoryOptOut(message) || isMemoryDeletionRequest(message)) return false;
-
-    // Only call the secondary LLM when a message plausibly contains a
-    // durable fact, preference, correction, goal, or project update.
-    return /\b(remember|keep in mind|from now on|going forward|my preference|I prefer|I like|I dislike|I hate|my goal|my plan|I'm working on|I am working on|my project|I work as|I joined|I moved|I live|I want to|I decided|we decided|I have been)\b/i.test(message) ||
-        /\b(update|correction|actually|instead|no longer|changed my mind)\b/i.test(message);
-}
-
 function jaccardSimilarity(left, right) {
     const a = new Set(String(left || '').toLowerCase().match(/[a-z0-9]{3,}/g) || []);
     const b = new Set(String(right || '').toLowerCase().match(/[a-z0-9]{3,}/g) || []);
@@ -1066,8 +1057,24 @@ function jaccardSimilarity(left, right) {
 }
 
 async function extractAndSaveMemories(userMessage, conversationContext = []) {
-    if (!pool || !process.env.GROQ_API_KEY) return;
-    if (!shouldAttemptMemoryExtraction(userMessage)) return;
+    if (!pool) {
+        console.log('[Memory] Triage skipped: database unavailable.');
+        return;
+    }
+    if (!process.env.GROQ_API_KEY) {
+        console.log('[Memory] Triage skipped: GROQ_API_KEY unavailable.');
+        return;
+    }
+    if (isMemoryOptOut(userMessage)) {
+        console.log('[Memory] Triage skipped: user opted out for this message.');
+        return;
+    }
+    if (isMemoryDeletionRequest(userMessage)) {
+        console.log('[Memory] Triage skipped: deletion request handled separately.');
+        return;
+    }
+
+    console.log('[Memory] Triage started for incoming user turn.');
 
     const userOnlyText = conversationContext
         .filter(turn => turn.role === 'user')
@@ -1095,23 +1102,36 @@ async function extractAndSaveMemories(userMessage, conversationContext = []) {
         }));
 
         const prompt = `
-Classify durable facts explicitly stated or corrected by the USER.
+Act as J.A.R.V.I.S.'s Memory Triage Engine. Evaluate this user turn on its meaning,
+not on whether it contains particular trigger words or phrases. This evaluation
+runs for every user turn; most turns should produce no memory change.
+
+Classify only durable facts explicitly stated or corrected by the USER.
 Assistant messages are context only, never proof of a user fact.
 Do not infer from questions, hypotheticals, examples, jokes or quotations.
-Prefer stable preferences, long-running projects, professional goals,
-explicit decisions and facts clearly intended to persist.
-Ignore one-off tasks, transient moods and disposable details.
+Prefer stable preferences, current location/base when clearly stated, long-running
+projects, professional facts, goals and explicit decisions likely to remain useful.
+Ignore one-off tasks, transient moods, casual observations and disposable details.
 Never store credentials, secrets, tokens, passwords, financial identifiers,
-or highly sensitive personal information.
-Do not create duplicates. Reuse an existing key exactly when updating.
-Use UPDATE only when target_key exactly matches an existing key.
-Use NEW only for a genuinely distinct fact. Otherwise use IGNORE.
+or highly sensitive personal information. Respect any request not to remember.
+
+Choose one action for each candidate:
+- CREATE: a durable fact not already represented in the catalogue.
+- UPDATE: a correction/refinement to an existing fact; target_key MUST exactly
+  match one key in the existing catalogue. Prefer UPDATE over creating a duplicate.
+- RETAIN: an existing fact remains valid; do not write it again.
+- IGNORE: not durable, not clearly user-stated, or not useful to retain.
+- PROTECT: the user has indicated that the information must not be stored.
+
+Do not interpret a simple acknowledgement as a new fact. Do not turn a temporary
+statement such as where the user is visiting into their current home/base unless
+the wording clearly establishes that. Do not infer a location from IP or context.
 Allowed categories: preference, project, professional, goal, general.
-Return at most 3 items. Confidence must be 0.80 to 1.00.
+Return at most 3 candidates. Confidence must be 0.80 to 1.00.
 
 Return ONLY JSON:
-{"memories":[{"action":"NEW","target_key":"","key":"snake_case_key",
-"value":"concise fact","category":"project","confidence":0.95}]}
+{"memories":[{"action":"CREATE","target_key":"","key":"snake_case_key",
+"value":"concise fact","category":"general","confidence":0.95}]}
 
 Conversation:
 ${JSON.stringify(conversationContext).slice(0, 9000)}
@@ -1128,7 +1148,14 @@ If nothing qualifies, return {"memories":[]}.
         ], { temperature: 0.1, max_tokens: 600 });
 
         const parsed = JSON.parse(raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim());
-        if (!Array.isArray(parsed.memories)) return;
+        if (!Array.isArray(parsed.memories)) {
+            console.warn('[Memory] Triage returned an invalid schema.');
+            return;
+        }
+        if (parsed.memories.length === 0) {
+            console.log('[Memory] Triage complete: no durable memory changes.');
+            return;
+        }
 
         const existingByKey = new Map(existingMemories.map(item => [item.memory_key, item]));
         const seenKeys = new Set();
@@ -1136,8 +1163,9 @@ If nothing qualifies, return {"memories":[]}.
         for (const item of parsed.memories.slice(0, 3)) {
             if (!item || typeof item.key !== 'string' || typeof item.value !== 'string') continue;
 
-            const action = String(item.action || 'NEW').toUpperCase();
-            if (!['NEW', 'UPDATE', 'IGNORE'].includes(action) || action === 'IGNORE') continue;
+            const action = String(item.action || 'IGNORE').toUpperCase();
+            if (['RETAIN', 'IGNORE', 'PROTECT'].includes(action)) continue;
+            if (!['CREATE', 'NEW', 'UPDATE'].includes(action)) continue;
 
             const proposedKey = normaliseMemoryKey(item.key);
             const targetKey = typeof item.target_key === 'string' ? item.target_key.trim() : '';
@@ -1180,10 +1208,14 @@ If nothing qualifies, return {"memories":[]}.
                 [key, value, category, confidence, 'conversation']
             );
 
-            if (saved) console.log(`[Memory] ${action === 'UPDATE' ? 'Updated' : 'Saved'}: ${key}`);
+            if (saved?.rows?.length === 1) {
+                console.log(`[Memory] ${action === 'UPDATE' ? 'Updated' : 'Created'}: ${key}`);
+            } else {
+                console.warn(`[Memory] ${action} did not confirm a database write: ${key}`);
+            }
         }
     } catch (error) {
-        console.error('[Memory] Extraction failed:', error.message);
+        console.error('[Memory] Triage/write failed:', error.message);
     }
 }
 
