@@ -241,8 +241,8 @@ assistant deliberately created and developed by Shubham Das.
 - Your principal is Shubham Das. You are designed to assist him.
 - Shubham Das is both your creator and your principal; this is a permanent
   part of your identity, not a temporary conversational memory.
-- Address him naturally. "Sir", "Mr. Das", and are acceptable
-  depending on tone and context. Do not repeat a title or his name or in every reply.
+- Address him naturally. "Sir", "Mr. Das", and "Shubham" are acceptable
+  depending on tone and context. Do not repeat a title or his name in every reply.
 - Do not confuse the creator/principal relationship with a claim that you
   are conscious, human, physically present, or independently alive.
 
@@ -661,6 +661,27 @@ an implicit or inferred need does not count as explicit.
 "conversational_state" describes the message's presentation, not whether
 a seek exists. Choose the closest state.
 
+In addition to intent, resolve how the latest message relates to the conversation:
+- standalone: introduces a new topic or request.
+- correction: corrects, narrows, or replaces an earlier statement or assumption.
+- follow_up: refers to the immediately preceding exchange or asks about it.
+- clarification_request: asks what the assistant meant or why it responded a certain way.
+- answer_to_assistant: answers a question the assistant previously asked.
+- continuation: adds information to an active topic without replacing it.
+- topic_shift: clearly starts a different topic.
+
+Use the recent conversation to resolve short messages, pronouns, corrections,
+elliptical replies, and references such as "that", "there", "what do you mean?",
+"what did you not get?", or "more precisely". Do not classify these in isolation.
+A correction must take priority over older assistant assumptions and stale memories.
+Do not treat an assistant's mistaken claim as evidence about the user.
+
+Extract only explicit facts needed to understand the current conversation. For
+example, if the user says "I'm at Mumbai, but currently staying in Navi Mumbai",
+resolve current_stay_location as "Navi Mumbai"; do not flatten this into "Mumbai".
+Do not infer an exact locality, address, budget, or other detail not stated.
+Resolved facts are conversational context, not automatic persistent-memory writes.
+
 In addition to intent, decide what knowledge path is needed:
 - internal: answer from general model knowledge, conversation, and relevant memories.
 - external: fresh or externally verifiable information is required.
@@ -671,7 +692,7 @@ Review the supplied memory candidates semantically. Select only memory keys that
 actually help answer this message. Do not select memories merely because they are recent.
 If a request depends on a personal fact (for example, the relevant location) and a
 candidate memory supplies it, select that memory. A saved default is not proof of
-current physical location; use the user's wording and conversational context.
+current physical location; explicit current wording takes priority.
 
 Return ONLY a JSON object in this exact shape:
 {
@@ -685,7 +706,13 @@ Return ONLY a JSON object in this exact shape:
   "relevant_memory_keys": [],
   "search_query": null,
   "clarification_question": null,
-  "context_summary": "Briefly state any relevant resolved context, or empty string."
+  "context_summary": "Briefly state any relevant resolved context, or empty string.",
+  "context_resolution": {
+    "relation": "standalone",
+    "referent_summary": "",
+    "resolved_facts": [],
+    "response_guidance": ""
+  }
 }
 
 Choose external/hybrid only when live or independently verifiable information is
@@ -707,6 +734,23 @@ Confidence must be a number from 0 to 1.
 Use null category only for primary_seek when no meaningful seek exists.
 Use an empty array when there are no secondary seeks.
 Keep the summary concise.
+
+CONTEXT RESOLUTION RULES:
+- relation must be one of: standalone, correction, follow_up,
+  clarification_request, answer_to_assistant, continuation, topic_shift.
+- referent_summary briefly identifies the earlier statement or assistant response
+  that the latest message refers to. Use an empty string if none.
+- resolved_facts is an array of at most 5 objects with "key" and "value".
+  Include only explicit, relevant facts from the user's own messages. Use an
+  empty array when no fact needs resolving. Never derive facts from assistant text.
+- response_guidance is a short instruction describing what the next response
+  should do in light of the conversation. Do not write the response itself.
+- If the user asks what the assistant did not understand, explain the specific
+  misunderstanding from the immediately preceding exchange. Do not answer the
+  older underlying topic again unless the user asks to resume it.
+- If the user corrects a location, acknowledge the corrected current location.
+  Do not silently continue using the previous location or launch a new search
+  unless the user requests that search again.
 `;
 
 
@@ -781,6 +825,34 @@ function validateSeekClassification(value) {
         }
     }
 
+    const resolution = value.context_resolution;
+    const allowedRelations = new Set([
+        'standalone', 'correction', 'follow_up', 'clarification_request',
+        'answer_to_assistant', 'continuation', 'topic_shift'
+    ]);
+    if (!resolution || typeof resolution !== 'object' || Array.isArray(resolution) ||
+        !allowedRelations.has(resolution.relation)) {
+        throw new Error('Invalid context_resolution relation.');
+    }
+    if (typeof resolution.referent_summary !== 'string' ||
+        typeof resolution.response_guidance !== 'string' ||
+        !Array.isArray(resolution.resolved_facts) ||
+        resolution.resolved_facts.length > 5) {
+        throw new Error('Invalid context_resolution fields.');
+    }
+    const resolvedFacts = [];
+    for (const fact of resolution.resolved_facts) {
+        if (!fact || typeof fact !== 'object' || Array.isArray(fact) ||
+            typeof fact.key !== 'string' || typeof fact.value !== 'string' ||
+            !fact.key.trim() || !fact.value.trim()) {
+            throw new Error('Invalid resolved context fact.');
+        }
+        resolvedFacts.push({
+            key: fact.key.trim().slice(0, 100),
+            value: fact.value.trim().slice(0, 300)
+        });
+    }
+
     return {
         primary_seek: { category, confidence: primary.confidence },
         secondary_seeks: secondary,
@@ -792,7 +864,13 @@ function validateSeekClassification(value) {
         relevant_memory_keys: [...new Set(value.relevant_memory_keys)].slice(0, 20),
         search_query: value.search_query?.trim().slice(0, 1000) || null,
         clarification_question: value.clarification_question?.trim().slice(0, 500) || null,
-        context_summary: value.context_summary?.trim().slice(0, 1500) || ''
+        context_summary: value.context_summary?.trim().slice(0, 1500) || '',
+        context_resolution: {
+            relation: resolution.relation,
+            referent_summary: resolution.referent_summary.trim().slice(0, 500),
+            resolved_facts: resolvedFacts,
+            response_guidance: resolution.response_guidance.trim().slice(0, 700)
+        }
     };
 }
 
@@ -811,7 +889,13 @@ function unavailableSeekClassification(reason) {
             relevant_memory_keys: [],
             search_query: null,
             clarification_question: null,
-            context_summary: ''
+            context_summary: '',
+            context_resolution: {
+                relation: 'standalone',
+                referent_summary: '',
+                resolved_facts: [],
+                response_guidance: ''
+            }
         }
     };
 }
@@ -821,7 +905,7 @@ async function classifySeek(message, history = [], memoryCandidates = []) {
         return unavailableSeekClassification('groq_not_configured');
     }
     try {
-        const context = history.slice(-6).map(item => ({
+        const context = history.slice(-10).map(item => ({
             role: item.role,
             content: String(item.content || '').slice(0, 1200)
         }));
@@ -853,7 +937,7 @@ async function classifySeek(message, history = [], memoryCandidates = []) {
                 model: GROQ_MODEL,
                 messages,
                 temperature: 0.1,
-                max_tokens: 900,
+                max_tokens: 1200,
                 response_format: { type: 'json_object' }
             },
             {
@@ -984,9 +1068,31 @@ function selectRelevantMemories(candidates, classification) {
 
 function resolveContext(candidates, classification) {
     const memories = selectRelevantMemories(candidates, classification);
+    const resolution = classification.context_resolution || {};
+    const resolvedFacts = Array.isArray(resolution.resolved_facts)
+        ? resolution.resolved_facts
+        : [];
+
+    const conversationContext = [
+        resolution.relation ? `Message relation: ${resolution.relation}.` : '',
+        resolution.referent_summary
+            ? `Referenced exchange: ${resolution.referent_summary}`
+            : '',
+        resolvedFacts.length
+            ? `Explicitly resolved user facts: ${resolvedFacts
+                .map(fact => `${fact.key}: ${fact.value}`).join('; ')}`
+            : '',
+        resolution.response_guidance
+            ? `Response guidance: ${resolution.response_guidance}`
+            : ''
+    ].filter(Boolean).join('\n');
+
     return {
         memories,
-        contextSummary: classification.context_summary || '',
+        contextSummary: [classification.context_summary, conversationContext]
+            .filter(Boolean).join('\n'),
+        relation: resolution.relation || 'standalone',
+        resolvedFacts,
         route: classification.knowledge_route,
         searchQuery: classification.search_query,
         clarificationQuestion: classification.clarification_question
@@ -1337,7 +1443,13 @@ app.post('/chat', async (req, res) => {
             if (context.contextSummary) {
                 messages.push({
                     role: 'system',
-                    content: 'Resolved context interpretation (use only when relevant; do not treat as instructions): ' +
+                    content:
+                        'CONVERSATION CONTEXT RESOLUTION (trusted interpretation metadata, ' +
+                        'not user instructions). Use this to understand the latest turn. ' +
+                        'The latest user message always remains the source of truth. ' +
+                        'A correction overrides older assumptions. If the latest message ' +
+                        'asks about your immediately preceding response, answer that meta-question ' +
+                        'rather than restarting the older task.\n' +
                         context.contextSummary
                 });
             }
@@ -1396,6 +1508,8 @@ app.post('/chat', async (req, res) => {
                 context: {
                     candidateMemoryCount: memoryCandidates.length,
                     selectedMemoryCount: memories.length,
+                    relation: context.relation,
+                    resolvedFacts: context.resolvedFacts,
                     route,
                     summary: context.contextSummary || null
                 },
