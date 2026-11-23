@@ -16,6 +16,8 @@ const PORT = Number(process.env.PORT) || 3000;
 
 const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions';
 const GROQ_MODEL = process.env.GROQ_MODEL || 'openai/gpt-oss-120b';
+const GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions';
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
 const MEMORY_TABLE = 'public.jarvis_memories';
 
 const MAX_HISTORY_MESSAGES = 20;
@@ -540,33 +542,121 @@ function formatSearchContext(search) {
 }
 
 // ============================================================
-// 8. GROQ RESPONSE GENERATION
+// 8. LLM PROVIDER MANAGER — GROQ PRIMARY, GEMINI FALLBACK
 // ============================================================
 
+const LLM_PROVIDERS = [
+    {
+        id: 'groq',
+        label: 'Groq',
+        apiUrl: GROQ_API_URL,
+        apiKey: () => process.env.GROQ_API_KEY,
+        model: () => GROQ_MODEL
+    },
+    {
+        id: 'gemini',
+        label: 'Gemini',
+        apiUrl: GEMINI_API_URL,
+        apiKey: () => process.env.GEMINI_API_KEY,
+        model: () => GEMINI_MODEL
+    }
+];
+
+function isRetryableProviderError(error) {
+    const status = Number(error.response?.status || 0);
+    if ([400, 401, 403, 404, 422].includes(status)) return false;
+    if ([408, 409, 425, 429].includes(status) || status >= 500) return true;
+
+    return !status && Boolean(
+        error.code === 'ECONNABORTED' ||
+        error.code === 'ETIMEDOUT' ||
+        error.code === 'ECONNRESET' ||
+        error.code === 'ENOTFOUND' ||
+        error.code === 'EAI_AGAIN' ||
+        error.message?.includes('empty response') ||
+        error.message?.includes('empty content') ||
+        error.message?.includes('failed validation')
+    );
+}
+
 async function generateReply(messages, options = {}) {
-    if (!process.env.GROQ_API_KEY) {
-        throw new Error('GROQ_API_KEY is not configured.');
+    const availableProviders = LLM_PROVIDERS.filter(provider => provider.apiKey());
+    if (!availableProviders.length) {
+        throw new Error('No LLM provider is configured. Set GROQ_API_KEY or GEMINI_API_KEY.');
     }
 
-    const response = await http.post(
-        GROQ_API_URL,
-        {
-            model: GROQ_MODEL,
+    const failures = [];
+
+    for (const provider of availableProviders) {
+        const requestBody = {
+            model: provider.model(),
             messages,
             temperature: options.temperature ?? 0.7,
             max_tokens: options.max_tokens ?? MAX_RESPONSE_TOKENS
-        },
-        {
-            timeout: options.timeout ?? LLM_TIMEOUT_MS,
-            headers: { Authorization: `Bearer ${process.env.GROQ_API_KEY}` }
+        };
+        if (options.response_format) {
+            requestBody.response_format = options.response_format;
         }
-    );
 
-    const reply = response.data?.choices?.[0]?.message?.content;
-    if (typeof reply !== 'string' || !reply.trim()) {
-        throw new Error('The LLM returned an empty response.');
+        try {
+            console.log(`[LLM] Requesting ${provider.label} (${provider.model()}).`);
+            const response = await http.post(
+                provider.apiUrl,
+                requestBody,
+                {
+                    timeout: options.timeout ?? LLM_TIMEOUT_MS,
+                    headers: { Authorization: `Bearer ${provider.apiKey()}` }
+                }
+            );
+
+            const reply = response.data?.choices?.[0]?.message?.content;
+            if (typeof reply !== 'string' || !reply.trim()) {
+                const emptyError = new Error('The LLM returned an empty response.');
+                emptyError.code = 'EMPTY_LLM_RESPONSE';
+                throw emptyError;
+            }
+
+            const cleanReply = reply.trim();
+            if (typeof options.validateResponse === 'function') {
+                const valid = await options.validateResponse(cleanReply);
+                if (!valid) {
+                    const validationError = new Error('The LLM response failed validation.');
+                    validationError.code = 'LLM_RESPONSE_VALIDATION_FAILED';
+                    throw validationError;
+                }
+            }
+
+            console.log(`[LLM] Provider success: ${provider.id}.`);
+            return cleanReply;
+        } catch (error) {
+            failures.push({
+                provider: provider.id,
+                status: error.response?.status || null,
+                code: error.code || null,
+                message: error.message
+            });
+
+            console.error('[LLM] Provider failed:', {
+                provider: provider.id,
+                status: error.response?.status || null,
+                code: error.code || null,
+                message: error.message
+            });
+
+            if (!isRetryableProviderError(error)) {
+                throw error;
+            }
+
+            const nextProvider = availableProviders[availableProviders.indexOf(provider) + 1];
+            if (nextProvider) {
+                console.warn(`[LLM] Falling back from ${provider.id} to ${nextProvider.id}.`);
+            }
+        }
     }
-    return reply.trim();
+
+    const finalError = new Error('All configured LLM providers failed.');
+    finalError.providerFailures = failures;
+    throw finalError;
 }
 
 // ============================================================
@@ -931,30 +1021,20 @@ async function classifySeek(message, history = [], memoryCandidates = []) {
         }
         messages.push({ role: 'user', content: message.trim() });
 
-        const response = await http.post(
-            GROQ_API_URL,
-            {
-                model: GROQ_MODEL,
-                messages,
-                temperature: 0.1,
-                max_tokens: 1200,
-                response_format: { type: 'json_object' }
-            },
-            {
-                timeout: LLM_TIMEOUT_MS,
-                headers: { Authorization: `Bearer ${process.env.GROQ_API_KEY}` }
+        const content = await generateReply(messages, {
+            temperature: 0.1,
+            max_tokens: 1200,
+            response_format: { type: 'json_object' },
+            validateResponse(value) {
+                try {
+                    validateSeekClassification(JSON.parse(value));
+                    return true;
+                } catch {
+                    return false;
+                }
             }
-        );
-        const content = response.data?.choices?.[0]?.message?.content;
-        if (typeof content !== 'string' || !content.trim()) {
-            throw new Error('The classifier returned an empty response.');
-        }
-        let parsed;
-        try {
-            parsed = JSON.parse(content);
-        } catch {
-            throw new Error('The classifier returned invalid JSON.');
-        }
+        });
+        const parsed = JSON.parse(content);
         return { ok: true, reason: null, classification: validateSeekClassification(parsed) };
     } catch (error) {
         console.error('[Seek Classifier Error]', {
@@ -1676,7 +1756,8 @@ app.use((error, req, res, next) => {
 
 const server = app.listen(PORT, async () => {
     console.log(`[Server] J.A.R.V.I.S. backend listening on port ${PORT}`);
-    console.log(`[LLM] Model: ${GROQ_MODEL}`);
+    console.log(`[LLM] Primary model: ${GROQ_MODEL}`);
+console.log(`[LLM] Gemini fallback: ${GEMINI_MODEL} (${process.env.GEMINI_API_KEY ? 'configured' : 'not configured'})`);
     console.log(`[LLM] Response token limit: ${MAX_RESPONSE_TOKENS}`);
 
     if (!process.env.JARVIS_API_KEY) {
